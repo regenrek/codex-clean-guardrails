@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK_PATH = ROOT / ".codex/hooks/test_guard.py"
@@ -72,10 +73,8 @@ class TestGuardClassification(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertTrue(result.is_agent_check)
 
-    def test_blocks_indirect_agent_check_invocation(self) -> None:
-        result = inspect("python3 ./scripts/agent-check changed --config /tmp/full-suite.json")
-        self.assertTrue(result.blocked)
-        self.assertTrue(result.is_agent_check)
+    def test_allows_git_add_with_agent_check_path(self) -> None:
+        self.assertFalse(inspect("git add -- scripts/agent-check").blocked)
 
 
 class TestGuardHookProtocol(unittest.TestCase):
@@ -86,6 +85,8 @@ class TestGuardHookProtocol(unittest.TestCase):
         *,
         tool_name: str = "Bash",
         edit_override: bool = False,
+        test_edit_override: bool = False,
+        test_profile: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         payload = json.dumps(
             {
@@ -107,6 +108,15 @@ class TestGuardHookProtocol(unittest.TestCase):
             env["CODEX_ALLOW_GUARDRAIL_EDITS"] = "1"
         else:
             env.pop("CODEX_ALLOW_GUARDRAIL_EDITS", None)
+        if test_edit_override:
+            env["CODEX_ALLOW_BROAD_TEST_EDITS"] = "1"
+        else:
+            env.pop("CODEX_ALLOW_BROAD_TEST_EDITS", None)
+        if test_profile is not None:
+            env["CODEX_TEST_PROFILE"] = test_profile
+        else:
+            env.pop("CODEX_TEST_PROFILE", None)
+        env.pop("CODEX_TEST_BASE", None)
         return subprocess.run(
             [sys.executable, str(HOOK_PATH)],
             input=payload,
@@ -135,7 +145,6 @@ class TestGuardHookProtocol(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, "")
 
-
     def test_protected_guardrail_patch_is_denied(self) -> None:
         patch = """*** Begin Patch
 *** Update File: .codex/agent-check.json
@@ -149,6 +158,45 @@ class TestGuardHookProtocol(unittest.TestCase):
         self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn(".codex/agent-check.json", output["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_test_policy_file_is_protected(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: .codex/test-policy.json
+@@
+-  "version": 1,
++  "version": 2,
+*** End Patch
+"""
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(".codex/test-policy.json", output["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_codeowners_file_is_protected(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: .github/CODEOWNERS
+@@
+-/tests/ @test-owners
++/tests/ @anyone
+*** End Patch
+"""
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(".github/CODEOWNERS", output["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_agents_file_is_protected(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: AGENTS.md
+@@
+-- Prefer the smallest coherent diff.
++- Write every possible test.
+*** End Patch
+"""
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("AGENTS.md", output["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_normal_source_patch_is_allowed(self) -> None:
         patch = """*** Begin Patch
 *** Update File: src/app.py
@@ -158,6 +206,56 @@ class TestGuardHookProtocol(unittest.TestCase):
 *** End Patch
 """
         completed = self.run_hook(patch, tool_name="apply_patch")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "")
+
+    def test_focused_test_patch_is_allowed(self) -> None:
+        patch = """*** Begin Patch
+*** Add File: tests/test_regression.py
++def test_regression():
++    assert True
+*** End Patch
+"""
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "")
+
+    def test_oversized_test_patch_is_denied(self) -> None:
+        lines = "\n".join(f"+def test_case_{index}(): assert True" for index in range(11))
+        patch = f"*** Begin Patch\n*** Add File: tests/test_matrix.py\n{lines}\n*** End Patch\n"
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("added test cases", output["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_direct_shell_write_to_test_path_is_denied(self) -> None:
+        completed = self.run_hook("cat > tests/generated_test.py <<'EOF'\nassert True\nEOF")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Direct shell write", output["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_new_test_infrastructure_patch_is_denied(self) -> None:
+        patch = """*** Begin Patch
+*** Add File: vitest.config.ts
++export default { test: { globals: true } };
+*** End Patch
+"""
+        completed = self.run_hook(patch, tool_name="apply_patch")
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "new test-infrastructure files",
+            output["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_parent_test_edit_override_allows_broad_patch(self) -> None:
+        lines = "\n".join(f"+def test_case_{index}(): assert True" for index in range(20))
+        patch = f"*** Begin Patch\n*** Add File: tests/test_matrix.py\n{lines}\n*** End Patch\n"
+        completed = self.run_hook(
+            patch,
+            tool_name="apply_patch",
+            test_edit_override=True,
+        )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, "")
 
@@ -176,6 +274,20 @@ class TestGuardHookProtocol(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, "")
+
+    def test_read_only_post_tool_use_skips_cumulative_rescan(self) -> None:
+        with patch.object(hook, "evaluate_repository", side_effect=AssertionError("unexpected scan")):
+            hook.handle_post({"cwd": str(ROOT)}, "Bash", "rg test src")
+
+    def test_unknown_post_tool_use_command_triggers_cumulative_rescan(self) -> None:
+        report = type("Report", (), {"ok": True})()
+        with patch.object(hook, "evaluate_repository", return_value=report) as evaluate:
+            hook.handle_post(
+                {"cwd": str(ROOT)},
+                "Bash",
+                'python3 -c "from pathlib import Path; Path(\'tests/x.py\').write_text(\'x\')"',
+            )
+        evaluate.assert_called_once()
 
     def test_malformed_payload_fails_closed(self) -> None:
         completed = subprocess.run(

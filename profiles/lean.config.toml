@@ -1,4 +1,4 @@
-# Install as ~/.codex/lean.config.toml and start with: codex --profile lean
+# Optional reference profile for a deliberate manual opt-in; it is not installed by scripts/install.
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 model_reasoning_effort = "medium"

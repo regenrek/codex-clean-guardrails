@@ -48,6 +48,17 @@ def copy_new(source: Path, destination: Path, force: bool) -> None:
     print(f"write  {destination}")
 
 
+def _handler_commands(groups: list[Any]) -> set[str]:
+    commands: set[str] = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for handler in group.get("hooks", []):
+            if isinstance(handler, dict) and isinstance(handler.get("command"), str):
+                commands.add(handler["command"])
+    return commands
+
+
 def merge_hooks(source: Path, destination: Path) -> None:
     incoming: Any = json.loads(source.read_text(encoding="utf-8"))
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -58,16 +69,30 @@ def merge_hooks(source: Path, destination: Path) -> None:
         return
 
     current: Any = json.loads(destination.read_text(encoding="utf-8"))
-    current.setdefault("hooks", {}).setdefault("PreToolUse", [])
-    incoming_groups = incoming.get("hooks", {}).get("PreToolUse", [])
+    current_hooks = current.setdefault("hooks", {})
+    changed = False
 
-    serialized = json.dumps(current)
-    if "test_guard.py" not in serialized:
-        current["hooks"]["PreToolUse"].extend(incoming_groups)
+    for event, incoming_groups in incoming.get("hooks", {}).items():
+        if not isinstance(incoming_groups, list):
+            raise RuntimeError(f"incoming hooks.{event} must be an array")
+        current_groups = current_hooks.setdefault(event, [])
+        if not isinstance(current_groups, list):
+            raise RuntimeError(f"existing hooks.{event} must be an array")
+
+        existing_commands = _handler_commands(current_groups)
+        for group in incoming_groups:
+            incoming_commands = _handler_commands([group])
+            if incoming_commands and incoming_commands <= existing_commands:
+                continue
+            current_groups.append(group)
+            existing_commands.update(incoming_commands)
+            changed = True
+
+    if changed:
         destination.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
         print(f"merge  {destination}")
     else:
-        print(f"keep   {destination} (guard already registered)")
+        print(f"keep   {destination} (guard hooks already registered)")
 
 
 def agent_block(source: Path) -> str:
@@ -101,12 +126,6 @@ def append_gitignore(destination: Path) -> None:
         print(f"keep   {destination}")
 
 
-def install_profile(source: Path, force: bool) -> None:
-    home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-    destination = home / "lean.config.toml"
-    copy_new(source, destination, force)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", help="existing Git repository")
@@ -115,7 +134,11 @@ def parse_args() -> argparse.Namespace:
         default="vitest-pnpm",
         help="recipe name from recipes/ without .json (default: vitest-pnpm)",
     )
-    parser.add_argument("--install-profile", action="store_true", help="also install ~/.codex/lean.config.toml")
+    parser.add_argument(
+        "--no-ci",
+        action="store_true",
+        help="do not install the pull-request test-policy workflow",
+    )
     parser.add_argument("--force", action="store_true", help="back up and overwrite conflicting copied files")
     return parser.parse_args()
 
@@ -131,29 +154,37 @@ def main() -> int:
             available = ", ".join(sorted(path.stem for path in (source / "recipes").glob("*.json")))
             raise RuntimeError(f"unknown recipe {args.recipe!r}; available: {available}")
 
+        copy_new(source / ".codex/hooks/test_policy.py", target / ".codex/hooks/test_policy.py", args.force)
         copy_new(source / ".codex/hooks/test_guard.py", target / ".codex/hooks/test_guard.py", args.force)
+        copy_new(source / ".codex/test-policy.json", target / ".codex/test-policy.json", args.force)
         copy_new(source / "scripts/agent-check", target / "scripts/agent-check", args.force)
+        copy_new(source / "scripts/test-policy", target / "scripts/test-policy", args.force)
+        copy_new(source / "scripts/test-policy-ci", target / "scripts/test-policy-ci", args.force)
         copy_new(source / "scripts/doctor", target / "scripts/doctor", args.force)
         copy_new(recipe, target / ".codex/agent-check.json", args.force)
         merge_hooks(source / ".codex/hooks.json", target / ".codex/hooks.json")
         merge_agents(source / "AGENTS.md", target / "AGENTS.md")
         append_gitignore(target / ".gitignore")
 
-        target_config = target / ".codex/config.toml"
-        if target_config.exists():
-            example = target / ".codex/config.guardrails.example.toml"
-            shutil.copy2(source / ".codex/config.toml", example)
-            print(f"warn   existing {target_config}; review and merge {example}")
-        else:
-            copy_new(source / ".codex/config.toml", target_config, args.force)
-
-        if args.install_profile:
-            install_profile(source / "profiles/lean.config.toml", args.force)
+        if not args.no_ci:
+            copy_new(
+                source / "templates/github-actions/test-policy.yml",
+                target / ".github/workflows/codex-test-policy.yml",
+                args.force,
+            )
+        copy_new(
+            source / "templates/CODEOWNERS.tests.example",
+            target / ".github/CODEOWNERS.tests.example",
+            args.force,
+        )
 
         print("\ninstalled. run from the target repository:")
         print("  ./scripts/doctor")
-        print("  codex --profile lean")
+        print("  ./scripts/test-policy explain")
+        print("  ./scripts/test-policy check")
+        print("  codex")
         print("then open /hooks once to review and trust the project hook")
+        print("review .github/CODEOWNERS.tests.example before enabling required Code Owner review")
         return 0
     except (RuntimeError, OSError, json.JSONDecodeError) as exc:
         print(f"install: {exc}", file=sys.stderr)

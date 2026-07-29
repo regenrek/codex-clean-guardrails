@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "budget_seconds": 30,
+  "budget_seconds": 45,
   "max_changed_files": 200,
   "cache": true,
   "cache_failures": true,
@@ -33,7 +33,7 @@
         "test_*.py",
         "-v"
       ],
-      "timeout_seconds": 25,
+      "timeout_seconds": 40,
       "max_files": 80
     }
   ]

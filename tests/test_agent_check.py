@@ -14,6 +14,9 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_RUNNER = SOURCE_ROOT / "scripts/agent-check"
+SOURCE_TEST_POLICY = SOURCE_ROOT / ".codex/hooks/test_policy.py"
+SOURCE_TEST_POLICY_CONFIG = SOURCE_ROOT / ".codex/test-policy.json"
+SOURCE_TEST_POLICY_CLI = SOURCE_ROOT / "scripts/test-policy"
 
 
 def load_runner_module():
@@ -101,9 +104,13 @@ class AgentCheckFixture(unittest.TestCase):
         self.git("config", "user.name", "Test User")
 
         (self.root / "scripts").mkdir()
-        (self.root / ".codex").mkdir()
+        (self.root / ".codex/hooks").mkdir(parents=True)
         shutil.copy2(SOURCE_RUNNER, self.root / "scripts/agent-check")
+        shutil.copy2(SOURCE_TEST_POLICY_CLI, self.root / "scripts/test-policy")
+        shutil.copy2(SOURCE_TEST_POLICY, self.root / ".codex/hooks/test_policy.py")
+        shutil.copy2(SOURCE_TEST_POLICY_CONFIG, self.root / ".codex/test-policy.json")
         os.chmod(self.root / "scripts/agent-check", 0o755)
+        os.chmod(self.root / "scripts/test-policy", 0o755)
         (self.root / ".gitignore").write_text(".codex/cache/\n", encoding="utf-8")
         (self.root / "README.md").write_text("fixture\n", encoding="utf-8")
         self.git("add", ".")
@@ -136,12 +143,20 @@ class AgentCheckFixture(unittest.TestCase):
         )
 
     def run_check(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        for key in (
+            "CODEX_TEST_PROFILE",
+            "CODEX_ALLOW_BROAD_TEST_EDITS",
+            "CODEX_TEST_BASE",
+        ):
+            env.pop(key, None)
         return subprocess.run(
             [sys.executable, str(self.root / "scripts/agent-check"), "changed", *extra],
             cwd=self.root,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
             check=False,
         )
 
@@ -192,6 +207,34 @@ class TestAgentCheckIntegration(AgentCheckFixture):
             self.external_log.read_text(encoding="utf-8"),
             "src/app.py\nsrc/app.py\n",
         )
+    def test_test_policy_failure_prevents_validation_command(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path({str(self.external_log)!r}).write_text('ran')",
+        ]
+        self.write_config(
+            [
+                {
+                    "name": "must not run",
+                    "include": ["**/*.py"],
+                    "command": command,
+                    "timeout_seconds": 2,
+                }
+            ]
+        )
+        tests = self.root / "tests"
+        tests.mkdir()
+        (tests / "test_only.py").write_text(
+            "def test_only():\n    assert True\n",
+            encoding="utf-8",
+        )
+
+        completed = self.run_check()
+
+        self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
+        self.assertIn("test-authoring policy failed", completed.stdout)
+        self.assertFalse(self.external_log.exists())
 
     def test_timeout_kills_command_and_caches_the_timeout(self) -> None:
         self.write_config(
@@ -203,7 +246,7 @@ class TestAgentCheckIntegration(AgentCheckFixture):
                     "timeout_seconds": 0.2,
                 }
             ],
-            budget_seconds=0.5,
+            budget_seconds=2,
         )
         (self.root / "app.py").write_text("value = 1\n", encoding="utf-8")
 

@@ -28,6 +28,7 @@ DEFAULT_BUDGET_SECONDS = 120
 DEFAULT_MAX_OUTPUT_CHARS = 16_000
 DEFAULT_MAX_CHANGED_FILES = 200
 DEFAULT_GIT_TIMEOUT_SECONDS = 10
+DEFAULT_TEST_POLICY_COMMAND = "scripts/test-policy"
 
 
 class AgentCheckError(RuntimeError):
@@ -91,6 +92,7 @@ def repository_root() -> Path:
     return Path(completed.stdout.strip()).resolve()
 
 
+
 def load_config(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         raw = path.read_bytes()
@@ -113,6 +115,49 @@ def load_config(path: Path) -> tuple[dict[str, Any], bytes]:
 
 def _nul_lines(value: str) -> list[str]:
     return [part for part in value.split("\0") if part]
+
+
+def run_test_policy(
+    root: Path,
+    base: str | None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    script = root / DEFAULT_TEST_POLICY_COMMAND
+    if not script.is_file():
+        raise AgentCheckError(f"missing {DEFAULT_TEST_POLICY_COMMAND}")
+
+    command = [sys.executable, str(script), "check", "--json"]
+    if base:
+        command.extend(["--base", base])
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=bounded_timeout(deadline, DEFAULT_GIT_TIMEOUT_SECONDS),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AgentCheckTimeout("test-authoring policy check exceeded the validation budget") from exc
+
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+        raise AgentCheckError(f"test-policy returned invalid JSON: {detail}") from exc
+    if not isinstance(result, dict):
+        raise AgentCheckError("test-policy must return a JSON object")
+    if completed.returncode == 2 or "configuration_error" in result:
+        raise AgentCheckError(str(result.get("configuration_error", "test-policy configuration error")))
+    if completed.returncode not in {0, 1}:
+        raise AgentCheckError(f"test-policy exited with unexpected status {completed.returncode}")
+    if not isinstance(result.get("ok"), bool):
+        raise AgentCheckError("test-policy result must contain boolean ok")
+    return result
 
 
 def changed_files(
@@ -313,11 +358,12 @@ def fingerprint(
     config_bytes: bytes,
     files: Sequence[str],
     checks: Sequence[dict[str, Any]],
+    policy_result: dict[str, Any],
     base: str | None,
     deadline: float | None = None,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(b"codex-lean-guardrails:agent-check:v1\0")
+    digest.update(b"codex-lean-guardrails:agent-check:v2\0")
     digest.update(config_bytes)
     digest.update(b"\0")
     digest.update((base or "").encode())
@@ -325,13 +371,17 @@ def fingerprint(
     digest.update(git(root, "rev-parse", "--verify", "HEAD", check=False, deadline=deadline).strip().encode())
     digest.update(b"\0")
 
-    # Hash the runner itself so behavior changes invalidate prior cache entries.
-    _hash_file(
-        digest,
-        root,
+    # Hash the runner and authoring policy so behavior changes invalidate cache entries.
+    for implementation_path in (
         str(Path(__file__).resolve().relative_to(root)).replace("\\", "/"),
-        deadline,
-    )
+        DEFAULT_TEST_POLICY_COMMAND,
+        ".codex/test-policy.json",
+        ".codex/hooks/test_policy.py",
+    ):
+        _hash_file(digest, root, implementation_path, deadline)
+
+    digest.update(json.dumps(policy_result, sort_keys=True, separators=(",", ":")).encode())
+    digest.update(b"\0")
 
     for path in files:
         _hash_file(digest, root, path, deadline)
@@ -536,6 +586,25 @@ def main() -> int:
             emit(result, args.json)
             return 1
 
+        policy_result = run_test_policy(root, args.base, deadline)
+        if not policy_result["ok"]:
+            violations = policy_result.get("violations", [])
+            reason = "; ".join(str(item) for item in violations) or "test-authoring policy failed"
+            result = {
+                "status": "fail",
+                "scope": "changed",
+                "cached": False,
+                "changed_files": len(files),
+                "checks_run": 0,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "reason": reason,
+                "test_policy": policy_result,
+            }
+            if not args.json:
+                print(f"agent-check: test-authoring policy failed: {reason}")
+            emit(result, args.json)
+            return 1
+
         checks = select_checks(config, files, root)
 
         if not checks:
@@ -547,13 +616,14 @@ def main() -> int:
                 "checks_run": 0,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "reason": "no configured check matched the changed files",
+                "test_policy": policy_result,
             }
             if not args.json:
                 print("agent-check: no configured check matched the changed files")
             emit(result, args.json)
             return 0
 
-        key = fingerprint(root, config_bytes, files, checks, args.base, deadline)
+        key = fingerprint(root, config_bytes, files, checks, policy_result, args.base, deadline)
         path = cache_path(root, config, key)
         cache_enabled = bool(config.get("cache", True)) and not args.no_cache
 
@@ -656,6 +726,7 @@ def main() -> int:
             "checks_run": len(results),
             "duration_seconds": round(time.monotonic() - started, 3),
             "fingerprint": key,
+            "test_policy": policy_result,
             "results": results,
         }
 

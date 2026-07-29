@@ -1,55 +1,86 @@
 # codex-lean-guardrails
 
-Hard guardrails for a specific Codex failure mode: a small implementation task grows into repeated full test, lint, typecheck, build, coverage, or CI runs while the user waits.
+Codex guardrails for two related failure modes:
 
-This repository does not ask the model to "please be minimal" and hope for the best. It changes the execution surface:
+1. a small change triggers repeated full test, lint, typecheck, build, coverage, or CI runs;
+2. the implementation grows into an unnecessary test project with broad matrices, new fixtures, snapshots, helpers, or E2E coverage that the task did not require.
 
-1. `AGENTS.md` defines a small scope and stopping contract.
-2. A Codex `PreToolUse` hook blocks raw validation commands before they start.
-3. The same hook prevents `apply_patch` from weakening the active guardrail files.
-4. The agent gets one exact validation entry point: `./scripts/agent-check changed`.
-5. That runner selects configured checks from changed files, has a hard wall-clock budget, stops on first failure, and caches both passes and failures for an identical repository state.
-6. Full validation remains in CI or an explicit human-run session.
+This repository does not solve either problem with a longer prompt alone. It narrows the execution surface and checks the cumulative Git diff.
 
-## What this prevents
+## Design principles
+
+The policy deliberately does **not** use a universal test-to-production-code ratio. The right amount of testing depends on the behavior and risk of the change. The default rules instead enforce reviewability:
+
+- write the smallest test that proves the changed behavior;
+- prefer an existing test file and the cheapest deterministic layer;
+- test public or user-observable behavior, not private implementation details;
+- do not duplicate the same behavior at unit, integration, browser, and E2E layers;
+- keep expensive tests at the narrowest useful scope;
+- keep snapshots short and reviewable;
+- require an explicit profile for test-only work, a first test suite, broad matrices, new E2E coverage, or large fixture changes;
+- keep humans and CI authoritative for semantic correctness.
+
+The numeric limits are configurable circuit breakers. They are not coverage targets and should never be filled merely because room remains.
+
+## How it works
 
 ```text
-Codex edits one file
-  -> runs the full suite
-  -> waits/polls for 20 minutes
-  -> changes another file
-  -> reruns the full suite
-  -> adds broad tests "for confidence"
-  -> reruns lint + typecheck + build + suite
-```
+AGENTS.md
+  -> defines scope, test-selection, and stopping rules
 
-The guarded flow is:
+PreToolUse
+  -> blocks raw/full validation before it starts
+  -> protects active guardrail files
+  -> preflights test edits made through apply_patch
+  -> blocks obvious direct shell writes to test paths
 
-```text
-Codex makes one coherent edit batch
-  -> ./scripts/agent-check changed
-  -> related/bounded checks, max 120 seconds
-  -> same repository state returns cached result
-  -> full suite runs once in CI when appropriate
+PostToolUse
+  -> checks the complete Git diff after apply_patch and any Bash command not known to be read-only
+  -> catches many small edits that exceed the policy cumulatively
+
+Stop
+  -> checks the complete diff before Codex finishes
+  -> allows one correction pass, then stops instead of looping forever
+
+scripts/test-policy
+  -> exposes the same cumulative policy to humans
+
+scripts/test-policy-ci
+  -> evaluates pull requests with policy code and config loaded from the trusted base revision
+  -> prevents policy code or config changes from self-approving while the workflow remains protected
+
+scripts/agent-check
+  -> runs the policy first
+  -> executes only configured changed-file checks within a hard budget
+  -> caches pass and failure results for an identical repository state
+
+GitHub Actions + CODEOWNERS
+  -> make the policy independent of the local agent session
+  -> route exceptional test changes to explicit human review
 ```
 
 ## Quick start
 
-Requires Git, Python 3, and a current Codex CLI or desktop build with hooks.
+Requirements:
+
+- Git
+- Python 3.10 or newer
+- a current Codex CLI or desktop build with hooks
 
 ```bash
 git clone https://github.com/regenrek/codex-lean-guardrails.git
 cd codex-lean-guardrails
 
-# Install into an existing repository.
-./scripts/install /path/to/project --recipe vitest-pnpm --install-profile
+./scripts/install /path/to/project \
+  --recipe vitest-pnpm
 
 cd /path/to/project
 ./scripts/doctor
-codex --profile lean
+./scripts/test-policy explain
+codex
 ```
 
-Inside Codex, open `/hooks` once to review and trust the project hook. Restart Codex after editing `hooks.json`; live hook edits have open reliability reports.
+Inside Codex, open `/hooks` once to review and trust the project hooks. Restart Codex after changing hook definitions.
 
 Available recipes:
 
@@ -61,23 +92,103 @@ Available recipes:
 
 For another stack, copy `recipes/custom.example.json` to `.codex/agent-check.json` and define one genuinely targeted command.
 
-## Files installed
+Use `--no-ci` only when the repository already has equivalent pull-request enforcement:
 
-```text
-AGENTS.md
-.codex/config.toml
-.codex/hooks.json
-.codex/hooks/test_guard.py
-.codex/agent-check.json
-scripts/agent-check
-scripts/doctor
+```bash
+./scripts/install /path/to/project --recipe vitest-pnpm --no-ci
 ```
 
-When a target already has `.codex/config.toml`, the installer does not silently rewrite it. It writes `.codex/config.guardrails.example.toml` for review. Existing `hooks.json` and `AGENTS.md` files are merged.
+## Default focused test policy
 
-## The hard gate
+The installed `.codex/test-policy.json` starts with this ordinary feature and bug-fix profile:
 
-The hook intercepts Codex Bash calls and denies direct validation through common runners and orchestrators, including:
+| Guard | Default |
+| --- | ---: |
+| Test files touched | 2 |
+| New test files | 1 |
+| Added test lines | 180 |
+| Detected added test cases | 8 |
+| Inline production files receiving tests | 1 |
+| Existing test-infrastructure files touched | 1 |
+| New test-infrastructure files | 0 |
+| Added test-infrastructure lines | 80 |
+| Existing integration/E2E/system files touched | 1 |
+| New integration/E2E/system files | 0 |
+| Added expensive-test lines | 120 |
+| Snapshot files touched | 1 |
+| New snapshot files | 1 |
+| Added snapshot lines | 50 total and per file |
+| Fixture/golden/test-data files touched | 1 |
+| New fixture/golden/test-data files | 1 |
+| Added fixture lines | 120 |
+| Deleted test files | 0 |
+| Binary test artifacts | blocked |
+| Product-code change required when tests change | yes |
+| First test suite may be created | no |
+
+These defaults are intentionally conservative. A typical bug fix should usually add one regression case, not approach the limits.
+
+### Profiles
+
+```bash
+# Ordinary implementation work. This is the default.
+CODEX_TEST_PROFILE=focused codex
+
+# Human-approved feature work that genuinely spans more test locations.
+CODEX_TEST_PROFILE=expanded codex
+
+# Intentional test maintenance, consolidation, or first-suite setup.
+CODEX_TEST_PROFILE=tests-only codex
+
+# Exceptional human-owned task. The diff is still reported and reviewed.
+CODEX_ALLOW_BROAD_TEST_EDITS=1 codex
+```
+
+Set these variables on the **Codex parent process**. A variable placed inside a child command proposed by Codex does not alter the hook's environment.
+
+The same profiles can be inspected and run without Codex:
+
+```bash
+./scripts/test-policy explain
+./scripts/test-policy check
+./scripts/test-policy check --base origin/main
+./scripts/test-policy check --profile expanded
+./scripts/test-policy check --json
+```
+
+Without `--base`, the policy compares the current worktree with `HEAD`. Existing uncommitted test changes therefore count toward the same budget. Start Codex from a clean worktree, or set `CODEX_TEST_BASE` when the task intentionally continues an existing branch diff.
+
+## What the authoring policy detects
+
+The cumulative checker covers tracked changes, staged changes, unstaged changes, renames, and untracked files. It measures:
+
+- normal test files;
+- common concrete test declarations across JavaScript/TypeScript, Python, Rust, Go, JVM, .NET, Ruby, PHP, Swift, C/C++, Dart, and Elixir;
+- tests embedded in production files;
+- test runner configuration, setup files, and helper/support subsystems;
+- integration, E2E, system, and acceptance tests;
+- snapshots;
+- fixtures, golden files, and test data;
+- binary or oversized test artifacts;
+- test-only changes under the focused and expanded profiles;
+- deletion of test files;
+- creation of a first test suite.
+
+It is intentionally conservative. It cannot prove that two tests are semantically redundant, that a parameter table represents the right equivalence classes, or that an expected-output update is correct. `AGENTS.md`, review, CODEOWNERS, and CI cover those judgments.
+
+### TDD remains possible
+
+A small test patch may be written before the implementation patch. `PreToolUse` evaluates that single patch without requiring product code in the same patch. `PostToolUse`, `Stop`, `scripts/agent-check`, and pull-request CI then enforce the relationship on the cumulative diff.
+
+## Bounded validation
+
+The only local validation command available to Codex is:
+
+```bash
+./scripts/agent-check changed
+```
+
+Direct commands such as these are denied unless a human starts Codex with `CODEX_ALLOW_FULL_VALIDATION=1`:
 
 ```text
 pnpm test                    pytest
@@ -88,146 +199,104 @@ eslint / tsc                 make test
 playwright / cypress         gradle test / mvn verify
 ```
 
-Normal inspection is allowed:
+The wrapper:
+
+- checks the authoring policy before launching any test runner;
+- selects configured checks from changed files;
+- uses argv arrays without a shell;
+- applies a total wall-clock budget and per-check timeout;
+- stops on the first failure;
+- kills the child process group on timeout;
+- fails closed when a configured related-test command cannot safely handle a deleted file;
+- caches passes and failures by commit, configuration, runner implementation, changed paths, and changed contents.
+
+Do not place a full repository suite in `.codex/agent-check.json`. Full validation belongs in CI or a deliberate human-run session.
+
+## Pull-request enforcement
+
+The installer adds `.github/workflows/codex-test-policy.yml` and compares the complete pull-request diff with full Git history. The first merge uses a visible bootstrap fallback because the target branch has no trusted runner yet. After that, the workflow extracts `scripts/test-policy-ci` from the target branch; that runner loads the policy implementation and limits from the same trusted revision before inspecting the pull-request checkout. Once the workflow file itself is protected, a pull request cannot make its own check pass by weakening the checker or limits it changes.
+
+Maintainer-applied labels select an intentional exception. The workflow reruns when these labels are added or removed:
 
 ```text
-rg test src
-git diff -- tests
-cat tests/example.test.ts
+test-policy-expanded
+test-policy-tests-only
+test-policy-exception
+test-policy-maintenance
 ```
 
-The only agent validation path is the exact foreground command:
+`test-policy-expanded` and `test-policy-tests-only` select bounded profiles. `test-policy-exception` bypasses mechanical authoring limits. `test-policy-maintenance` separately permits changes to active guardrail files. Keeping those exceptions separate prevents a broad test task from silently weakening enforcement.
 
-```bash
-./scripts/agent-check changed
-```
+Make the `test-policy` job a required status check in a GitHub ruleset or branch-protection rule. Protect the workflow itself with CODEOWNERS. For organization or enterprise deployments, the strongest option is a ruleset-required workflow stored on a protected branch or in a dedicated policy repository, because a pull request then cannot redefine the required workflow. Local hooks alone are not sufficient because hooks are workflow guardrails rather than a security boundary.
 
-Alternate arguments such as `--config`, indirect execution through `python`, and background execution are denied. This prevents Codex from swapping in an unbounded validation plan or recreating the background polling loop.
+The installer also adds `.github/CODEOWNERS.tests.example`. Replace `@your-org/test-owners`, copy or merge it into `.github/CODEOWNERS`, and require code-owner review. The example owns:
 
-### Guardrail integrity
+- test paths and test filename patterns;
+- test runner configuration, setup files, and shared helpers;
+- snapshots, fixtures, and golden files;
+- the test policy and hook implementation;
+- the pull-request workflow;
+- the CODEOWNERS file itself.
 
-The same `PreToolUse` hook observes `apply_patch` and denies edits to the active execution surface:
+## Files installed
 
 ```text
-.codex/agent-check.json
-.codex/config.toml
+AGENTS.md
 .codex/hooks.json
 .codex/hooks/test_guard.py
+.codex/hooks/test_policy.py
+.codex/agent-check.json
+.codex/test-policy.json
 scripts/agent-check
+scripts/test-policy
+scripts/test-policy-ci
+scripts/doctor
+.github/workflows/codex-test-policy.yml
+.github/CODEOWNERS.tests.example
 ```
 
-Normal source patches remain allowed. This makes accidental self-weakening substantially harder; it is still a workflow guardrail rather than a security sandbox.
+The installer never creates, copies, or changes `.codex/config.toml`; Codex uses the existing personal configuration at `~/.codex/config.toml` in the normal start path. Existing `AGENTS.md` and hook definitions are merged. Running the installer again does not duplicate the managed block or hooks.
 
-### Intentional overrides
+`profiles/lean.config.toml` remains an optional reference profile for an explicit, manual opt-in. It is not installed and is not required for the normal workflow.
 
-Start the **Codex parent process** with an override when a human deliberately wants broader behavior:
+## Intentional maintenance overrides
 
 ```bash
-# Deliberately allow raw/full validation inside this Codex session.
+# Allow raw/full validation for this Codex session.
 CODEX_ALLOW_FULL_VALIDATION=1 codex
 
-# Deliberately maintain the protected guardrail files through apply_patch.
+# Allow Codex to edit the protected policy and execution files.
 CODEX_ALLOW_GUARDRAIL_EDITS=1 codex
+
+# Bypass authoring limits for an exceptional human-owned task.
+CODEX_ALLOW_BROAD_TEST_EDITS=1 codex
 ```
 
-Putting either variable inside a command proposed by Codex does not bypass the hook because the hook runs before that child command starts.
+Protected files include `AGENTS.md`, the active runner, local and trusted CI policy runners, policy configuration, hook implementation, hook configuration, installed policy workflow, and CODEOWNERS review gate.
 
-## Configure the bounded runner
-
-`.codex/agent-check.json` is deliberately small:
-
-```json
-{
-  "version": 1,
-  "budget_seconds": 120,
-  "max_changed_files": 200,
-  "cache": true,
-  "cache_failures": true,
-  "checks": [
-    {
-      "name": "Vitest related tests",
-      "include": ["**/*.ts", "**/*.tsx"],
-      "exclude": ["node_modules/**", "dist/**"],
-      "command": [
-        "pnpm", "exec", "vitest", "related", "--run", "{files}"
-      ],
-      "timeout_seconds": 90,
-      "max_files": 60
-    }
-  ]
-}
-```
-
-Commands are argv arrays and run without a shell. `{files}` expands to matching changed files as separate arguments. Checks run sequentially and stop on the first failure. The global budget covers repository inspection, fingerprinting, and all selected checks; Git calls and child processes receive bounded timeouts.
-
-`max_changed_files` stops very large worktrees before hashing or execution, while each check can set a smaller `max_files`. A deleted file that matches a related-test check fails closed by default because dependency selection may be incomplete; CI remains authoritative. Set `allow_deleted: true` only for a command that genuinely handles deleted paths.
-
-A fingerprint includes the current commit, configured plan, runner implementation, changed filenames, and changed file contents. Running the same failed or passing state again returns the cached result instead of spending the same minutes twice.
-
-Do not place the full repository suite in this config. The hook would still prevent Codex from launching it directly, but the wrapper would become an expensive loophole.
-
-## Keep full coverage in CI
-
-Comprehensive tests are still valuable; they are simply moved out of the agent's edit loop. A practical split is:
-
-| Lane | Purpose |
-| --- | --- |
-| `agent-check changed` | related tests or one small smoke/sentinel check |
-| pull-request CI | affected packages and affected dependents |
-| merge/nightly/release | full suite, broad E2E, coverage, release validation |
-
-Cancel obsolete GitHub Actions runs so commits do not queue redundant suites:
-
-```yaml
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-```
-
-This repository's own workflow uses that policy and runs only its small zero-dependency guardrail tests.
-
-## Lean Codex defaults
-
-The included project config and optional `~/.codex/lean.config.toml` use:
-
-```toml
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-model_reasoning_effort = "medium"
-
-[agents]
-enabled = false
-
-[features]
-hooks = true
-goals = false
-```
-
-The repository does not pin a model. The point is to constrain execution, not claim that one model always behaves better.
-
-## Verify it
+## Verify the installation
 
 ```bash
 ./scripts/doctor
-python3 -m unittest discover -s tests -p 'test_*.py' -v
 ./scripts/agent-check changed
 ```
 
-`doctor` checks the hook registration, simulates allowed and denied Bash and `apply_patch` calls, checks the wrapper CLI, and warns about Git worktrees because project hook discovery currently has an open worktree-specific issue.
+`doctor` checks hook registration and protocol output, simulates allowed and denied Bash and `apply_patch` calls, validates the local policy and validation CLIs, checks the cumulative policy, and reports whether the CI and CODEOWNERS templates are installed.
 
 ## Limits
 
-- Hooks are documented by OpenAI as guardrails, not a complete security boundary.
-- Protected-file enforcement covers normal `apply_patch` calls. Arbitrary shell-generated file writes or specialized tool paths can still bypass a project workflow guardrail.
-- The shell detector covers normal Codex-generated commands, not every possible shell-obfuscation technique.
-- Project hooks only load for trusted projects.
-- `write_stdin` polling does not run `PreToolUse` again, which is why the original long command must be blocked before it starts.
-- Vitest `related` follows static imports and can miss dynamic loaders. Add one explicit sentinel check for those boundaries.
-- Pytest has no generic source-to-test dependency graph. The included recipe only runs changed test files.
-- Cache keys describe repository state and the configured plan, not every external machine or service dependency. CI remains the source of truth.
-- This does not make a 30-minute suite faster. It prevents an agent from launching that suite repeatedly in its inner loop.
+- OpenAI documents hooks as useful guardrails, not a complete security boundary.
+- `PreToolUse` can prevent a supported tool call. `PostToolUse` runs after the side effect and cannot undo it, which is why the policy is also checked at stop and in CI.
+- The shell-write detector blocks common direct writes but is not a complete shell parser. `PostToolUse` skips only a conservative allowlist of read-only inspection commands and rescans after unknown Bash commands; `Stop` and trusted-base CI catch the final cumulative state.
+- Specialized tool paths may not pass through the standard hook path.
+- Project hooks load only for trusted projects.
+- `write_stdin` polling does not invoke `PreToolUse` again, so the original long command must be blocked before it starts.
+- A path and line budget cannot determine semantic test quality. Human review is still required.
+- Vitest `related` follows static imports and may miss dynamic loaders. Add one explicit sentinel check for those boundaries.
+- Pytest has no generic source-to-test dependency graph. The included recipe runs changed test files only.
+- This does not make a 30-minute suite faster. It prevents the agent from repeatedly launching it and prevents ordinary tasks from silently creating an oversized test surface.
 
-See [docs/evidence.md](docs/evidence.md) for the source-backed rationale and the distinction between official documentation and community issue evidence.
+See [docs/test-policy.md](docs/test-policy.md) for configuration details and [docs/evidence.md](docs/evidence.md) for the source-backed rationale.
 
 ## License
 
