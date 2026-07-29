@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Verify that the Codex guardrail files are internally consistent."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def repository_root() -> Path:
+    completed = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("run doctor inside a Git repository")
+    return Path(completed.stdout.strip()).resolve()
+
+
+def hook_payload(command: str, tool_name: str = "Bash") -> str:
+    return json.dumps(
+        {
+            "session_id": "doctor",
+            "turn_id": "doctor",
+            "cwd": os.getcwd(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_use_id": "doctor",
+            "tool_input": {"command": command},
+        }
+    )
+
+
+def run_hook(
+    hook: Path,
+    command: str,
+    *,
+    tool_name: str = "Bash",
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.pop("CODEX_ALLOW_FULL_VALIDATION", None)
+    env.pop("CODEX_ALLOW_GUARDRAIL_EDITS", None)
+    return subprocess.run(
+        [sys.executable, str(hook)],
+        input=hook_payload(command, tool_name),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def main() -> int:
+    root = repository_root()
+    errors: list[str] = []
+    warnings: list[str] = []
+    passes: list[str] = []
+
+    required = [
+        root / "AGENTS.md",
+        root / ".codex/config.toml",
+        root / ".codex/hooks.json",
+        root / ".codex/hooks/test_guard.py",
+        root / ".codex/agent-check.json",
+        root / "scripts/agent-check",
+    ]
+    for path in required:
+        if path.exists():
+            passes.append(f"found {path.relative_to(root)}")
+        else:
+            errors.append(f"missing {path.relative_to(root)}")
+
+    hooks_path = root / ".codex/hooks.json"
+    if hooks_path.exists():
+        try:
+            hooks: Any = json.loads(hooks_path.read_text(encoding="utf-8"))
+            groups = hooks.get("hooks", {}).get("PreToolUse", [])
+            matchers = [group.get("matcher", "") for group in groups if isinstance(group, dict)]
+            commands = [
+                handler.get("command", "")
+                for group in groups
+                for handler in group.get("hooks", [])
+                if isinstance(handler, dict)
+            ]
+            if any("test_guard.py" in command for command in commands):
+                passes.append("hooks.json registers test_guard.py for PreToolUse")
+            else:
+                errors.append("hooks.json does not register test_guard.py")
+            if any("Bash" in matcher and "apply_patch" in matcher for matcher in matchers):
+                passes.append("hook matcher covers Bash and apply_patch")
+            else:
+                errors.append("hook matcher must cover Bash and apply_patch")
+        except (json.JSONDecodeError, AttributeError) as exc:
+            errors.append(f"invalid .codex/hooks.json: {exc}")
+
+    config_path = root / ".codex/config.toml"
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        for expected in (
+            'approval_policy = "on-request"',
+            'sandbox_mode = "workspace-write"',
+            "enabled = false",
+            "hooks = true",
+            "goals = false",
+        ):
+            if expected not in text:
+                warnings.append(f"config.toml does not contain expected setting: {expected}")
+        if not any("config.toml" in item for item in warnings):
+            passes.append("config.toml contains lean defaults")
+
+    hook = root / ".codex/hooks/test_guard.py"
+    if hook.exists():
+        blocked = run_hook(hook, "pnpm test")
+        try:
+            blocked_json = json.loads(blocked.stdout)
+            decision = blocked_json["hookSpecificOutput"]["permissionDecision"]
+            if decision == "deny":
+                passes.append("hook denies a raw test command")
+            else:
+                errors.append("hook did not deny a raw test command")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            errors.append(f"hook returned invalid deny output: {blocked.stdout or blocked.stderr}")
+
+        safe = run_hook(hook, "rg test src")
+        if safe.returncode == 0 and not safe.stdout.strip():
+            passes.append("hook allows a non-validation command containing the word test")
+        else:
+            errors.append(f"hook unexpectedly blocked a safe command: {safe.stdout or safe.stderr}")
+
+        wrapper = run_hook(hook, "./scripts/agent-check changed")
+        if wrapper.returncode == 0 and not wrapper.stdout.strip():
+            passes.append("hook allows the bounded agent-check wrapper")
+        else:
+            errors.append(f"hook unexpectedly blocked agent-check: {wrapper.stdout or wrapper.stderr}")
+
+        background = run_hook(hook, "./scripts/agent-check changed &")
+        try:
+            background_json = json.loads(background.stdout)
+            if background_json["hookSpecificOutput"]["permissionDecision"] == "deny":
+                passes.append("hook denies background execution of agent-check")
+            else:
+                errors.append("hook did not deny background agent-check")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            errors.append("hook returned invalid output for background agent-check")
+
+        swapped_config = run_hook(hook, "./scripts/agent-check changed --config /tmp/full.json")
+        try:
+            swapped_json = json.loads(swapped_config.stdout)
+            if swapped_json["hookSpecificOutput"]["permissionDecision"] == "deny":
+                passes.append("hook denies alternate agent-check arguments")
+            else:
+                errors.append("hook allowed alternate agent-check arguments")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            errors.append("hook returned invalid output for alternate agent-check arguments")
+
+        protected_patch = """*** Begin Patch
+*** Update File: .codex/agent-check.json
+@@
+-{}
++{"checks": []}
+*** End Patch
+"""
+        protected = run_hook(hook, protected_patch, tool_name="apply_patch")
+        try:
+            protected_json = json.loads(protected.stdout)
+            if protected_json["hookSpecificOutput"]["permissionDecision"] == "deny":
+                passes.append("hook protects active guardrail files from apply_patch")
+            else:
+                errors.append("hook did not protect guardrail files")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            errors.append("hook returned invalid output for protected apply_patch")
+
+        source_patch = """*** Begin Patch
+*** Update File: src/app.py
+@@
+-old
++new
+*** End Patch
+"""
+        source = run_hook(hook, source_patch, tool_name="apply_patch")
+        if source.returncode == 0 and not source.stdout.strip():
+            passes.append("hook allows normal source apply_patch calls")
+        else:
+            errors.append(f"hook unexpectedly blocked a source patch: {source.stdout or source.stderr}")
+
+    agent_check = root / "scripts/agent-check"
+    if agent_check.exists():
+        completed = subprocess.run(
+            [sys.executable, str(agent_check), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            passes.append("agent-check CLI loads")
+        else:
+            errors.append(f"agent-check CLI failed to load: {completed.stderr}")
+
+    git_marker = root / ".git"
+    if git_marker.is_file():
+        warnings.append(
+            "this checkout is a Git worktree (.git is a file); current Codex versions have an open issue "
+            "where project hooks may be ignored in worktrees. Prefer a user-level hook or verify with /hooks"
+        )
+
+    codex = subprocess.run(
+        ["sh", "-lc", "command -v codex >/dev/null 2>&1 && codex --version || true"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if codex:
+        passes.append(f"Codex found: {codex}")
+    else:
+        warnings.append("Codex executable not found; static checks still passed")
+
+    for item in passes:
+        print(f"PASS  {item}")
+    for item in warnings:
+        print(f"WARN  {item}")
+    for item in errors:
+        print(f"FAIL  {item}")
+
+    if errors:
+        print(f"\ndoctor: {len(errors)} failure(s), {len(warnings)} warning(s)")
+        return 1
+
+    print(f"\ndoctor: healthy with {len(warnings)} warning(s)")
+    print("next: restart Codex after hook edits, review/trust project hooks with /hooks, then use codex --profile lean")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

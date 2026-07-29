@@ -1,0 +1,18 @@
+{
+  "description": "Block unbounded validation, protect the active guardrails, and force Codex through one cached, time-bounded entry point.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/test_guard.py\"",
+            "timeout": 5,
+            "statusMessage": "Enforcing bounded validation"
+          }
+        ]
+      }
+    ]
+  }
+}

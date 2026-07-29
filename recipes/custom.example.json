@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "budget_seconds": 120,
+  "max_changed_files": 200,
+  "cache": true,
+  "cache_failures": true,
+  "max_cache_entries": 50,
+  "max_output_chars": 16000,
+  "checks": [
+    {
+      "name": "Replace with one targeted project check",
+      "include": [
+        "src/**"
+      ],
+      "exclude": [
+        "generated/**",
+        ".codex/cache/**"
+      ],
+      "command": [
+        "your-project-command",
+        "{files}"
+      ],
+      "timeout_seconds": 90,
+      "max_files": 50
+    }
+  ]
+}

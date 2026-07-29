@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "budget_seconds": 120,
+  "max_changed_files": 200,
+  "cache": true,
+  "cache_failures": true,
+  "max_cache_entries": 50,
+  "max_output_chars": 16000,
+  "checks": [
+    {
+      "name": "Vitest related tests",
+      "include": [
+        "*.js",
+        "*.jsx",
+        "*.ts",
+        "*.tsx",
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.ts",
+        "**/*.tsx"
+      ],
+      "exclude": [
+        "**/*.d.ts",
+        "node_modules/**",
+        "dist/**",
+        "build/**",
+        ".codex/cache/**"
+      ],
+      "command": [
+        "pnpm",
+        "exec",
+        "vitest",
+        "related",
+        "--run",
+        "{files}"
+      ],
+      "timeout_seconds": 90,
+      "max_files": 60
+    }
+  ]
+}

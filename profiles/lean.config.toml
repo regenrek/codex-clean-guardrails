@@ -1,0 +1,11 @@
+# Install as ~/.codex/lean.config.toml and start with: codex --profile lean
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
+
+[agents]
+enabled = false
+
+[features]
+hooks = true
+goals = false

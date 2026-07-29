@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "budget_seconds": 30,
+  "max_changed_files": 200,
+  "cache": true,
+  "cache_failures": true,
+  "max_cache_entries": 30,
+  "max_output_chars": 16000,
+  "checks": [
+    {
+      "name": "guardrail unit tests",
+      "include": [
+        "*.py",
+        "**/*.py",
+        "*.json",
+        "**/*.json",
+        "*.toml",
+        "**/*.toml",
+        "AGENTS.md",
+        "README.md"
+      ],
+      "exclude": [
+        ".codex/cache/**"
+      ],
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py",
+        "-v"
+      ],
+      "timeout_seconds": 25,
+      "max_files": 80
+    }
+  ]
+}

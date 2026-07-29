@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Install the guardrails into an existing Git repository without dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+START = "<!-- codex-lean-guardrails:start -->"
+END = "<!-- codex-lean-guardrails:end -->"
+
+
+def source_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def target_root(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    completed = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"{path} is not inside a Git repository")
+    return Path(completed.stdout.strip()).resolve()
+
+
+def copy_new(source: Path, destination: Path, force: bool) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and source.read_bytes() != destination.read_bytes():
+        if not force:
+            raise RuntimeError(f"refusing to overwrite existing {destination}; rerun with --force after review")
+        backup = destination.with_suffix(destination.suffix + ".before-codex-guardrails")
+        shutil.copy2(destination, backup)
+        print(f"backup {backup}")
+    shutil.copy2(source, destination)
+    if os.name != "nt" and os.access(source, os.X_OK):
+        destination.chmod(destination.stat().st_mode | 0o111)
+    print(f"write  {destination}")
+
+
+def merge_hooks(source: Path, destination: Path) -> None:
+    incoming: Any = json.loads(source.read_text(encoding="utf-8"))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if not destination.exists():
+        shutil.copy2(source, destination)
+        print(f"write  {destination}")
+        return
+
+    current: Any = json.loads(destination.read_text(encoding="utf-8"))
+    current.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    incoming_groups = incoming.get("hooks", {}).get("PreToolUse", [])
+
+    serialized = json.dumps(current)
+    if "test_guard.py" not in serialized:
+        current["hooks"]["PreToolUse"].extend(incoming_groups)
+        destination.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        print(f"merge  {destination}")
+    else:
+        print(f"keep   {destination} (guard already registered)")
+
+
+def agent_block(source: Path) -> str:
+    body = source.read_text(encoding="utf-8").strip()
+    return f"{START}\n{body}\n{END}"
+
+
+def merge_agents(source: Path, destination: Path) -> None:
+    block = agent_block(source)
+    if destination.exists():
+        text = destination.read_text(encoding="utf-8")
+        if START in text and END in text:
+            prefix, remainder = text.split(START, 1)
+            _, suffix = remainder.split(END, 1)
+            updated = prefix.rstrip() + "\n\n" + block + suffix
+        else:
+            updated = text.rstrip() + "\n\n" + block + "\n"
+    else:
+        updated = block + "\n"
+    destination.write_text(updated, encoding="utf-8")
+    print(f"merge  {destination}")
+
+
+def append_gitignore(destination: Path) -> None:
+    entry = ".codex/cache/"
+    text = destination.read_text(encoding="utf-8") if destination.exists() else ""
+    if entry not in {line.strip() for line in text.splitlines()}:
+        destination.write_text(text.rstrip() + ("\n" if text else "") + entry + "\n", encoding="utf-8")
+        print(f"merge  {destination}")
+    else:
+        print(f"keep   {destination}")
+
+
+def install_profile(source: Path, force: bool) -> None:
+    home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    destination = home / "lean.config.toml"
+    copy_new(source, destination, force)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", help="existing Git repository")
+    parser.add_argument(
+        "--recipe",
+        default="vitest-pnpm",
+        help="recipe name from recipes/ without .json (default: vitest-pnpm)",
+    )
+    parser.add_argument("--install-profile", action="store_true", help="also install ~/.codex/lean.config.toml")
+    parser.add_argument("--force", action="store_true", help="back up and overwrite conflicting copied files")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    source = source_root()
+
+    try:
+        target = target_root(args.target)
+        recipe = source / "recipes" / f"{args.recipe}.json"
+        if not recipe.exists():
+            available = ", ".join(sorted(path.stem for path in (source / "recipes").glob("*.json")))
+            raise RuntimeError(f"unknown recipe {args.recipe!r}; available: {available}")
+
+        copy_new(source / ".codex/hooks/test_guard.py", target / ".codex/hooks/test_guard.py", args.force)
+        copy_new(source / "scripts/agent-check", target / "scripts/agent-check", args.force)
+        copy_new(source / "scripts/doctor", target / "scripts/doctor", args.force)
+        copy_new(recipe, target / ".codex/agent-check.json", args.force)
+        merge_hooks(source / ".codex/hooks.json", target / ".codex/hooks.json")
+        merge_agents(source / "AGENTS.md", target / "AGENTS.md")
+        append_gitignore(target / ".gitignore")
+
+        target_config = target / ".codex/config.toml"
+        if target_config.exists():
+            example = target / ".codex/config.guardrails.example.toml"
+            shutil.copy2(source / ".codex/config.toml", example)
+            print(f"warn   existing {target_config}; review and merge {example}")
+        else:
+            copy_new(source / ".codex/config.toml", target_config, args.force)
+
+        if args.install_profile:
+            install_profile(source / "profiles/lean.config.toml", args.force)
+
+        print("\ninstalled. run from the target repository:")
+        print("  ./scripts/doctor")
+        print("  codex --profile lean")
+        print("then open /hooks once to review and trust the project hook")
+        return 0
+    except (RuntimeError, OSError, json.JSONDecodeError) as exc:
+        print(f"install: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
