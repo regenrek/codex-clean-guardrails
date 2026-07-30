@@ -235,6 +235,40 @@ class TestPatchPolicy(PolicyRepo):
         self.assertFalse(report.ok)
         self.assertIn("added test cases", "\n".join(report.violations))
 
+    def test_delete_then_add_same_test_path_counts_as_one_updated_file(self) -> None:
+        patch = """*** Begin Patch
+*** Delete File: tests/test_example.py
+*** Add File: tests/test_example.py
++def test_replacement():
++    assert True
+*** End Patch
+"""
+        with clean_policy_env():
+            summary = policy.summarize_patch(self.root, patch)
+        self.assertEqual(summary.changed_paths, ("tests/test_example.py",))
+        self.assertEqual(summary.test_files_touched, 1)
+        self.assertEqual(summary.new_test_files, 0)
+        self.assertEqual(summary.deleted_test_files, 0)
+        self.assertEqual(summary.added_test_cases, 1)
+
+    def test_repeated_updates_to_same_test_path_count_as_one_file(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: tests/test_example.py
+@@
++def test_first():
++    assert True
+*** Update File: tests/test_example.py
+@@
++def test_second():
++    assert True
+*** End Patch
+"""
+        with clean_policy_env():
+            summary = policy.summarize_patch(self.root, patch)
+        self.assertEqual(summary.changed_paths, ("tests/test_example.py",))
+        self.assertEqual(summary.test_files_touched, 1)
+        self.assertEqual(summary.added_test_cases, 2)
+
     def test_first_suite_patch_requires_explicit_profile(self) -> None:
         for path in (self.root / "tests").rglob("*"):
             if path.is_file():

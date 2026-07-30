@@ -965,6 +965,36 @@ def _patch_blocks(command: str) -> list[tuple[str, str, str | None, str]]:
     return blocks
 
 
+def _coalesced_patch_blocks(command: str) -> list[tuple[str, str, str | None, str]]:
+    coalesced: list[tuple[str, str, str | None, str]] = []
+    indexes: dict[str, int] = {}
+    for action, path, moved_from, body in _patch_blocks(command):
+        if moved_from:
+            coalesced.append((action, path, moved_from, body))
+            continue
+
+        existing_index = indexes.get(path)
+        if existing_index is None:
+            indexes[path] = len(coalesced)
+            coalesced.append((action, path, None, body))
+            continue
+
+        previous_action, _, _, previous_body = coalesced[existing_index]
+        if previous_action == "Add":
+            combined_action = "Delete" if action == "Delete" else "Add"
+        elif action == "Delete":
+            combined_action = "Delete"
+        else:
+            combined_action = "Update"
+        coalesced[existing_index] = (
+            combined_action,
+            path,
+            None,
+            f"{previous_body}\n{body}",
+        )
+    return coalesced
+
+
 def summarize_patch(
     root: Path,
     command: str,
@@ -981,7 +1011,7 @@ def summarize_patch(
     fixture_files: list[FileMetrics] = []
     changed_paths: list[str] = []
 
-    for action, path, moved_from, body in _patch_blocks(command):
+    for action, path, moved_from, body in _coalesced_patch_blocks(command):
         status = {"Add": "A", "Update": "R" if moved_from else "M", "Delete": "D"}[action]
         old_path = moved_from or path
         old_kind = classify_path(old_path, config)
