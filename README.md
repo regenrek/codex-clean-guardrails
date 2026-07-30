@@ -1,45 +1,49 @@
 # codex-lean-guardrails
 
-Keep Codex focused: small changes, relevant tests, bounded local validation.
+![A small coding robot balancing lightly while oversized test and build blocks stay behind](assets/codex-lean-guardrails-banner.png)
+
+Keep Codex focused. Make small changes. Write useful tests. Avoid long validation loops.
 
 ## Why I built this
 
-A small coding task can quietly turn into a much larger one:
+A small coding task can grow into a much larger one:
 
-- Codex repeatedly runs the full test suite, build, lint, or typecheck;
-- a focused fix grows new test files, matrices, fixtures, snapshots, or E2E coverage;
-- more time is spent validating speculative work than finishing the requested change.
+- Codex runs the full test suite or build several times.
+- A small fix gets many new tests, fixtures, snapshots, or E2E flows.
+- More time goes into extra work than into the requested change.
 
-Prompts help, but they are easy to drift away from. This project puts the working agreement in the repository and backs it with hooks, a cumulative Git-diff policy, and one bounded validation command.
+A prompt can ask Codex to stay focused. But prompts are easy to forget as a task grows.
 
-The goal is not “fewer tests at any cost.” It is to keep the smallest useful proof at the cheapest appropriate layer—and require an explicit human decision when a task genuinely needs more.
+This project puts the rules inside the repository. Hooks enforce the basic limits. One small validation command checks only the relevant changes.
+
+The goal is not to avoid tests. The goal is to write the smallest useful test at the right level. Larger test work still remains possible when a human approves it.
 
 ## What it does
 
 ```text
-Codex proposes a change
+Codex starts a task
         │
-        ├─ repository instructions keep scope and test selection focused
-        ├─ hooks block broad validation and preflight test edits
-        ├─ the cumulative diff catches test growth across many small edits
-        └─ agent-check runs only configured changed-file checks within a budget
+        ├─ project rules keep the task focused
+        ├─ hooks stop large test and build commands
+        ├─ a diff check tracks all test changes
+        └─ agent-check validates only changed files
 ```
 
-The installed guardrails:
+The guardrails:
 
-- define concise scope, test-authoring, and stopping rules in `AGENTS.md`;
-- block direct full-suite test, build, lint, typecheck, coverage, and E2E commands;
-- allow only `./scripts/agent-check changed` for normal local agent validation;
-- limit measurable test sprawl without using a universal test-to-code ratio;
-- protect the active policy and hook files from routine agent edits;
-- repeat the cumulative policy in pull-request CI using the trusted base revision;
-- provide explicit profiles and human-owned escape hatches for legitimate broad work.
+- give Codex clear rules for scope and tests;
+- stop full test suites and other broad checks during normal agent work;
+- use `./scripts/agent-check changed` for small local checks;
+- detect when test changes become too large;
+- protect the guardrail files from normal Codex edits;
+- check the same test limits again in pull-request CI;
+- offer broader profiles when a task truly needs them.
 
-Hooks are workflow guardrails, not a security boundary. They do not replace review or CI.
+Hooks guide the workflow. They are not a security boundary and do not replace review or CI.
 
 ## Quick start
 
-Requirements: Git, Python 3.10+, and a current Codex CLI or desktop build with hooks.
+You need Git, Python 3.10+, and a current Codex version with hook support.
 
 ```bash
 git clone https://github.com/regenrek/codex-lean-guardrails.git
@@ -52,7 +56,9 @@ cd /path/to/your-project
 codex
 ```
 
-Inside Codex, open `/hooks` once to review and trust the project hooks. During normal work, the only local validation command available to the agent is:
+Open `/hooks` once inside Codex. Review and trust the project hooks.
+
+During normal work, Codex can use this local validation command:
 
 ```bash
 ./scripts/agent-check changed
@@ -66,28 +72,28 @@ jest-pnpm
 pytest-changed-tests
 ```
 
-The installer merges existing project instructions and hooks. It never creates or changes `.codex/config.toml`; your personal `~/.codex/config.toml` remains in use.
+The installer keeps your existing project instructions and hooks. It does not create or change `.codex/config.toml`. Your personal `~/.codex/config.toml` stays active.
 
-See [usage and installation](docs/usage.md) for custom checks, profiles, CI setup, overrides, and operational details.
+See [usage and installation](docs/usage.md) for custom checks, profiles, CI setup, and overrides.
 
 ## What is included
 
-| Piece | Purpose |
+| Part | What it does |
 | --- | --- |
-| `AGENTS.md` | Scope, test-selection, and validation rules for Codex |
-| `.codex/hooks/` | Blocks broad commands, protects guardrails, and checks edits |
-| `.codex/test-policy.json` | Configurable focused, expanded, and tests-only limits |
-| `.codex/agent-check.json` | Repository-specific changed-file validation commands |
-| `scripts/agent-check` | Budgeted, cached validation for the current diff |
-| `scripts/test-policy` | Human-readable cumulative test-diff checks |
-| GitHub workflow | Trusted-base pull-request enforcement |
-| CODEOWNERS example | Human review routing for tests and policy files |
+| `AGENTS.md` | Gives Codex rules for scope, tests, and validation |
+| `.codex/hooks/` | Stops broad commands and checks edits |
+| `.codex/test-policy.json` | Defines the test-change limits |
+| `.codex/agent-check.json` | Defines checks for changed files |
+| `scripts/agent-check` | Runs small checks with a time limit and cache |
+| `scripts/test-policy` | Shows whether test changes fit the policy |
+| GitHub workflow | Checks the policy on pull requests |
+| CODEOWNERS example | Sends sensitive changes to human reviewers |
 
-No runtime dependency is added to the target application.
+The target app gets no new runtime dependency.
 
-## Dogfood benchmarks
+## Dogfood benchmark
 
-**Shiftline** is the only clean paired run so far: both variants used the same starter and prompt, required no manual follow-up, and passed hidden acceptance, the full suite, build, and E2E.
+**Shiftline** is the only clean A/B run so far. Both variants used the same starter and prompt. Neither run needed manual input. Both passed hidden acceptance, the full test suite, the build, and E2E.
 
 | Result | Default Codex | Lean guardrails |
 | --- | ---: | ---: |
@@ -99,16 +105,16 @@ No runtime dependency is added to the target application.
 | Hidden acceptance | 20/20 | 20/20 |
 | Final test, build, and E2E | passed | passed |
 
-In this run, Lean produced the same measured outcome with 60% fewer test lines and bounded validation instead of repeated full-suite commands. It is one local experiment, not proof of a universal improvement.
+Lean produced the same measured result with 60% fewer test lines. It used small checks instead of repeated full checks. This is one local experiment. It does not prove that guardrails always improve Codex.
 
-Read the [full benchmark notes](docs/benchmarks.md) for the earlier unsuccessful runs, methodology, trade-offs, and limitations.
+Read the [full benchmark notes](docs/benchmarks.md) for the earlier failed runs, methods, trade-offs, and limits.
 
 ## Documentation
 
-- [Usage and installation](docs/usage.md) — setup, recipes, profiles, overrides, CI, and troubleshooting boundaries
-- [Test-authoring policy](docs/test-policy.md) — measured limits, path classification, hooks, and tuning
-- [Benchmarks](docs/benchmarks.md) — all three dogfood runs, including negative results
-- [Evidence and rationale](docs/evidence.md) — source-backed design choices and known limits
+- [Usage and installation](docs/usage.md) — setup, profiles, overrides, and CI
+- [Test policy](docs/test-policy.md) — limits, hooks, and tuning
+- [Benchmarks](docs/benchmarks.md) — results and failed runs
+- [Evidence and rationale](docs/evidence.md) — sources and design choices
 
 ## License
 
