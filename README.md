@@ -7,6 +7,16 @@ Codex guardrails for two related failure modes:
 
 This repository does not solve either problem with a longer prompt alone. It narrows the execution surface and checks the cumulative Git diff.
 
+## Dogfood benchmarks
+
+Three progressively stricter React dogfood runs shaped the current design:
+
+- **Signal Path** established a baseline, but the Lean variant was never run and hidden acceptance failed. It is useful setup evidence, not an A/B result.
+- **Relay Control** produced fewer tests under Lean, but Lean also shipped a TypeScript build error and a stale E2E assertion. Less testing was not better in that run.
+- **Shiftline** was the first clean paired run: both variants passed 20/20 hidden acceptance cases, the full suite, build, and E2E. Lean added 37 test lines instead of 92, with essentially the same completion time.
+
+These are small local experiments, not a claim that the guardrails always improve an agent. See [the benchmark notes](docs/benchmarks.md) for the setup, results, limitations, and raw interpretation.
+
 ## Design principles
 
 The policy deliberately does **not** use a universal test-to-production-code ratio. The right amount of testing depends on the behavior and risk of the change. The default rules instead enforce reviewability:
